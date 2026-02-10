@@ -206,6 +206,7 @@ export class DefaultJobExecutor implements JobExecutor {
         
         if (!precheckResult.success) {
           stepStatuses.prechecks = 'failed';
+          context.onStepStatusChange?.('prechecks', 'failed');
           return {
             success: false,
             error: `Prechecks failed: ${precheckResult.error}`,
@@ -218,8 +219,10 @@ export class DefaultJobExecutor implements JobExecutor {
           };
         }
         stepStatuses.prechecks = 'success';
+        context.onStepStatusChange?.('prechecks', 'success');
       } else {
         stepStatuses.prechecks = 'skipped';
+        context.onStepStatusChange?.('prechecks', 'skipped');
       }
       
       // Check if aborted
@@ -263,6 +266,7 @@ export class DefaultJobExecutor implements JobExecutor {
         
         if (!workResult.success) {
           stepStatuses.work = 'failed';
+          context.onStepStatusChange?.('work', 'failed');
           return {
             success: false,
             error: `Work failed: ${workResult.error}`,
@@ -275,6 +279,7 @@ export class DefaultJobExecutor implements JobExecutor {
           };
         }
         stepStatuses.work = 'success';
+        context.onStepStatusChange?.('work', 'success');
       } else {
         // No work command - this is unusual but not an error
         this.logInfo(executionKey, 'work', '========== WORK SECTION START ==========');
@@ -282,6 +287,7 @@ export class DefaultJobExecutor implements JobExecutor {
         this.logInfo(executionKey, 'work', '========== WORK SECTION END ==========');
         log.warn(`Job ${node.name} has no work specified`);
         stepStatuses.work = 'skipped';
+        context.onStepStatusChange?.('work', 'skipped');
       }
       
       // Check if aborted
@@ -322,6 +328,7 @@ export class DefaultJobExecutor implements JobExecutor {
         
         if (!postcheckResult.success) {
           stepStatuses.postchecks = 'failed';
+          context.onStepStatusChange?.('postchecks', 'failed');
           return {
             success: false,
             error: `Postchecks failed: ${postcheckResult.error}`,
@@ -334,8 +341,10 @@ export class DefaultJobExecutor implements JobExecutor {
           };
         }
         stepStatuses.postchecks = 'success';
+        context.onStepStatusChange?.('postchecks', 'success');
       } else {
         stepStatuses.postchecks = 'skipped';
+        context.onStepStatusChange?.('postchecks', 'skipped');
       }
       
       // Check if aborted
@@ -374,8 +383,10 @@ export class DefaultJobExecutor implements JobExecutor {
           this.logInfo(executionKey, 'commit',
             'Commit found no evidence, but work was skipped (resuming). Succeeding without commit.');
           stepStatuses.commit = 'success';
+          context.onStepStatusChange?.('commit', 'success');
         } else {
           stepStatuses.commit = 'failed';
+          context.onStepStatusChange?.('commit', 'failed');
           return {
             success: false,
             error: `Commit failed: ${commitResult.error}`,
@@ -388,6 +399,7 @@ export class DefaultJobExecutor implements JobExecutor {
         }
       } else {
         stepStatuses.commit = 'success';
+        context.onStepStatusChange?.('commit', 'success');
       }
       
       // Get work summary
@@ -433,8 +445,18 @@ export class DefaultJobExecutor implements JobExecutor {
     const execution = this.activeExecutions.get(executionKey);
     
     if (execution) {
+      // Capture call stack for debugging
+      const stack = new Error().stack;
+      log.warn(`Executor.cancel() called`, {
+        planId,
+        nodeId,
+        pid: execution.process?.pid,
+        stack: stack?.split('\n').slice(1, 5).join('\n'),
+      });
+
       execution.aborted = true;
       if (execution.process) {
+        log.info(`Killing process PID ${execution.process.pid} for execution: ${executionKey}`);
         try {
           // Kill the process tree
           if (process.platform === 'win32') {
@@ -471,6 +493,24 @@ export class DefaultJobExecutor implements JobExecutor {
    */
   getLogsForPhase(planId: string, nodeId: string, phase: ExecutionPhase): LogEntry[] {
     return this.getLogs(planId, nodeId).filter(entry => entry.phase === phase);
+  }
+  
+  /**
+   * Get the current size of the log file for a job execution.
+   *
+   * @param planId - Plan identifier.
+   * @param nodeId - Node identifier.
+   * @returns File size in bytes, or 0 if no log file exists.
+   */
+  getLogFileSize(planId: string, nodeId: string): number {
+    const executionKey = `${planId}:${nodeId}`;
+    const logFile = this.getLogFilePath(executionKey);
+    if (!logFile || !fs.existsSync(logFile)) return 0;
+    try {
+      return fs.statSync(logFile).size;
+    } catch {
+      return 0;
+    }
   }
   
   /**
@@ -964,6 +1004,7 @@ export class DefaultJobExecutor implements JobExecutor {
         contextFiles: spec.contextFiles,
         maxTurns: spec.maxTurns,
         sessionId, // Pass session ID for resumption
+        jobId: node.id,
         logOutput: (line: string) => this.logInfo(executionKey, phase, line),
         onProcess: (proc: any) => {
           // Track the Copilot CLI process for monitoring (CPU/memory/tree)
@@ -1516,6 +1557,45 @@ export class DefaultJobExecutor implements JobExecutor {
     try {
       return fs.readFileSync(logFile, 'utf8');
     } catch (err) {
+      return `Error reading log file: ${err}`;
+    }
+  }
+  
+  /**
+   * Read logs from file starting at a byte offset.
+   * Used to capture only the logs produced during the current attempt.
+   */
+  readLogsFromFileOffset(planId: string, nodeId: string, byteOffset: number): string {
+    const executionKey = `${planId}:${nodeId}`;
+    const logFile = this.getLogFilePath(executionKey);
+
+    if (!logFile) {
+      return 'No log file found.';
+    }
+
+    try {
+      if (byteOffset <= 0) {
+        return fs.readFileSync(logFile, 'utf8');
+      }
+
+      const fd = fs.openSync(logFile, 'r');
+      try {
+        const stats = fs.fstatSync(fd);
+        const fileSize = stats.size;
+
+        if (byteOffset >= fileSize) {
+          return '';
+        }
+
+        const length = fileSize - byteOffset;
+        const buffer = Buffer.alloc(length);
+        fs.readSync(fd, buffer, 0, length, byteOffset);
+        return buffer.toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch (err: any) {
+      if (err.code === 'ENOENT') return 'No log file found.';
       return `Error reading log file: ${err}`;
     }
   }

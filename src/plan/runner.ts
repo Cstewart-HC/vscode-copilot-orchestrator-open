@@ -151,6 +151,15 @@ export interface JobExecutor {
   getLogsForPhase?(planId: string, nodeId: string, phase: ExecutionPhase): LogEntry[];
 
   /**
+   * Get the current size of the log file for a job execution.
+   *
+   * @param planId - Plan ID.
+   * @param nodeId - Node ID.
+   * @returns File size in bytes, or 0 if unavailable.
+   */
+  getLogFileSize?(planId: string, nodeId: string): number;
+
+  /**
    * Append a log entry to a job's execution log.
    *
    * @param planId  - Plan ID.
@@ -649,6 +658,41 @@ export class PlanRunner extends EventEmitter {
   }
   
   /**
+   * Get execution logs for a node starting from a given offset.
+   *
+   * Used to capture only the logs produced during the current attempt,
+   * avoiding accumulation of logs from previous attempts.
+   *
+   * @param planId         - Plan identifier.
+   * @param nodeId         - Node identifier.
+   * @param memoryOffset   - Index into the in-memory log array to start from.
+   * @param fileByteOffset - Byte offset into the on-disk log file to start from.
+   * @returns Formatted log text for the current attempt only.
+   */
+  private getNodeLogsFromOffset(planId: string, nodeId: string, memoryOffset: number, fileByteOffset: number): string {
+    if (!this.executor) return 'No executor available.';
+    
+    // First try memory logs (sliced from offset)
+    if (this.executor.getLogs) {
+      const allLogs = this.executor.getLogs(planId, nodeId);
+      if (allLogs.length > 0) {
+        const sliced = allLogs.slice(memoryOffset);
+        return sliced.length > 0 ? formatLogEntries(sliced) : 'No logs available.';
+      }
+    }
+    
+    // Try reading from log file (from byte offset)
+    if ('readLogsFromFileOffset' in this.executor && typeof (this.executor as any).readLogsFromFileOffset === 'function') {
+      const fileContent = (this.executor as any).readLogsFromFileOffset(planId, nodeId, fileByteOffset) as string;
+      if (fileContent && !fileContent.startsWith('No log file')) {
+        return fileContent;
+      }
+    }
+    
+    return 'No logs available.';
+  }
+  
+  /**
    * Get details for a specific execution attempt of a node.
    *
    * @param planId        - Plan identifier.
@@ -964,11 +1008,15 @@ export class PlanRunner extends EventEmitter {
     const sm = this.stateMachines.get(planId);
     if (!plan || !sm) return false;
     
-    log.info(`Canceling Plan: ${planId}`);
+    const cancelStack = new Error().stack;
+    log.info(`Canceling Plan: ${planId}`, {
+      stack: cancelStack?.split('\n').slice(1, 5).join('\n'),
+    });
     
     // Cancel all running jobs in executor
     for (const [nodeId, state] of plan.nodeStates) {
       if (state.status === 'running' || state.status === 'scheduled') {
+        log.info(`Canceling node via executor`, { planId, nodeId, status: state.status });
         this.executor?.cancel(planId, nodeId);
       }
     }
@@ -977,6 +1025,7 @@ export class PlanRunner extends EventEmitter {
     sm.cancelAll();
     
     // Clean up worktrees in background (since cancel is terminal, we don't need them)
+    log.info(`Starting cleanup of canceled Plan resources`, { planId });
     this.cleanupPlanResources(plan).catch(err => {
       log.error(`Failed to cleanup canceled Plan resources`, { planId, error: err.message });
     });
@@ -1031,6 +1080,7 @@ export class PlanRunner extends EventEmitter {
   private async cleanupPlanResources(plan: PlanInstance): Promise<void> {
     const repoPath = plan.repoPath;
     const cleanupErrors: string[] = [];
+    const cleanupStack = new Error().stack;
     
     // Collect all worktree paths from node states
     const worktreePaths: string[] = [];
@@ -1044,6 +1094,7 @@ export class PlanRunner extends EventEmitter {
     log.info(`Cleaning up Plan resources`, {
       planId: plan.id,
       worktrees: worktreePaths.length,
+      stack: cleanupStack?.split('\n').slice(1, 5).join('\n'),
     });
     
     // Remove worktrees (detached HEAD - no branches to clean up)
@@ -1297,6 +1348,11 @@ export class PlanRunner extends EventEmitter {
       nodeId: node.id,
     });
     
+    // Capture log offsets before this attempt starts so we can extract
+    // only the logs produced during this attempt when creating AttemptRecord.
+    let logMemoryOffset = this.executor?.getLogs?.(plan.id, node.id)?.length ?? 0;
+    let logFileOffset = this.executor?.getLogFileSize?.(plan.id, node.id) ?? 0;
+    
     try {
       // Transition to running
       sm.transition(node.id, 'running');
@@ -1418,7 +1474,7 @@ export class PlanRunner extends EventEmitter {
               stepStatuses: nodeState.stepStatuses ? { ...nodeState.stepStatuses } : undefined,
               worktreePath: nodeState.worktreePath,
               baseCommit: nodeState.baseCommit,
-              logs: this.getNodeLogs(plan.id, node.id),
+              logs: this.getNodeLogsFromOffset(plan.id, node.id, logMemoryOffset, logFileOffset),
               workUsed: node.work,
               metrics: nodeState.metrics,
               phaseMetrics: nodeState.phaseMetrics ? { ...nodeState.phaseMetrics } : undefined,
@@ -1569,7 +1625,7 @@ export class PlanRunner extends EventEmitter {
             stepStatuses: nodeState.stepStatuses ? { ...nodeState.stepStatuses } : undefined,
             worktreePath: nodeState.worktreePath,
             baseCommit: nodeState.baseCommit,
-            logs: this.getNodeLogs(plan.id, node.id),
+            logs: this.getNodeLogsFromOffset(plan.id, node.id, logMemoryOffset, logFileOffset),
             workUsed: node.work,
             metrics: nodeState.metrics,
             phaseMetrics: nodeState.phaseMetrics ? { ...nodeState.phaseMetrics } : undefined,
@@ -1589,19 +1645,158 @@ export class PlanRunner extends EventEmitter {
             : failedPhase === 'postchecks' ? node.postchecks
             : node.work;
           const normalizedFailedSpec = normalizeWorkSpec(failedWorkSpec);
+          const isAgentWork = normalizedFailedSpec?.type === 'agent';
           const isNonAgentWork = normalizedFailedSpec && normalizedFailedSpec.type !== 'agent';
           const autoHealEnabled = node.autoHeal !== false; // default true
           
+          // Detect external interruption (SIGTERM, SIGKILL, etc.)
+          const wasExternallyKilled = result.error?.includes('killed by signal');
+          
           const phaseAlreadyHealed = nodeState.autoHealAttempted?.[failedPhase as 'prechecks' | 'work' | 'postchecks'];
-          if (isHealablePhase && isNonAgentWork && autoHealEnabled && !phaseAlreadyHealed) {
+          
+          // Auto-retry is allowed if:
+          // 1. Non-agent work (existing behavior - swap to agent)
+          // 2. Agent work that was externally killed (retry same agent)
+          const shouldAttemptAutoRetry = isHealablePhase && autoHealEnabled && !phaseAlreadyHealed &&
+            (isNonAgentWork || (isAgentWork && wasExternallyKilled));
+          
+          if (shouldAttemptAutoRetry) {
+            if (!nodeState.autoHealAttempted) nodeState.autoHealAttempted = {};
+            nodeState.autoHealAttempted[failedPhase as 'prechecks' | 'work' | 'postchecks'] = true;
+            
+            if (isAgentWork && wasExternallyKilled) {
+              // Agent was interrupted - retry with same spec (don't swap to different agent spec)
+              log.info(`Auto-retry: agent was externally killed, retrying ${node.name} (phase: ${failedPhase})`, {
+                planId: plan.id,
+                nodeId: node.id,
+                signal: result.error,
+              });
+              
+              this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'info', '');
+              this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'info', '========== AUTO-RETRY: AGENT INTERRUPTED, RETRYING ==========');
+              this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'info', `Phase "${failedPhase}" agent was externally killed. Retrying same agent.`);
+              
+              // Reset state for the retry attempt
+              nodeState.error = undefined;
+              nodeState.startedAt = Date.now();
+              nodeState.attempts++;
+
+              // Capture log offsets for the retry attempt so its logs are isolated
+              const retryLogMemoryOffset = this.executor?.getLogs?.(plan.id, node.id)?.length ?? 0;
+              const retryLogFileOffset = this.executor?.getLogFileSize?.(plan.id, node.id) ?? 0;
+
+              // Execute with resumeFromPhase to skip already-passed phases
+              const retryContext: ExecutionContext = {
+                plan,
+                node,
+                baseCommit: nodeState.baseCommit!,
+                worktreePath,
+                copilotSessionId: nodeState.copilotSessionId,
+                resumeFromPhase: failedPhase as ExecutionContext['resumeFromPhase'],
+                previousStepStatuses: nodeState.stepStatuses,
+                onProgress: (step) => {
+                  log.debug(`Auto-retry progress: ${node.name} - ${step}`);
+                },
+                onStepStatusChange: (phase, status) => {
+                  if (!nodeState.stepStatuses) nodeState.stepStatuses = {};
+                  (nodeState.stepStatuses as any)[phase] = status;
+                },
+              };
+              
+              const retryResult = await this.executor!.execute(retryContext);
+              
+              // Store step statuses from retry attempt
+              if (retryResult.stepStatuses) {
+                nodeState.stepStatuses = retryResult.stepStatuses;
+              }
+              
+              // Capture session ID from retry attempt
+              if (retryResult.copilotSessionId) {
+                nodeState.copilotSessionId = retryResult.copilotSessionId;
+              }
+              
+              if (retryResult.success) {
+                log.info(`Auto-retry succeeded for ${node.name}!`, {
+                  planId: plan.id,
+                  nodeId: node.id,
+                });
+                this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'info', '========== AUTO-RETRY: SUCCESS ==========');
+                
+                autoHealSucceeded = true;
+                if (retryResult.completedCommit) {
+                  nodeState.completedCommit = retryResult.completedCommit;
+                }
+                if (retryResult.workSummary) {
+                  nodeState.workSummary = retryResult.workSummary;
+                  this.appendWorkSummary(plan, retryResult.workSummary);
+                }
+                if (retryResult.metrics) {
+                  nodeState.metrics = retryResult.metrics;
+                }
+                if (retryResult.phaseMetrics) {
+                  nodeState.phaseMetrics = { ...nodeState.phaseMetrics, ...retryResult.phaseMetrics };
+                }
+                // Update log offsets so the success record captures only retry logs
+                logMemoryOffset = retryLogMemoryOffset;
+                logFileOffset = retryLogFileOffset;
+                // Fall through to RI merge handling below
+              } else {
+                // Auto-retry also failed — record it and transition to failed
+                log.warn(`Auto-retry failed for ${node.name}`, {
+                  planId: plan.id,
+                  nodeId: node.id,
+                  error: retryResult.error,
+                });
+                this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'info', '========== AUTO-RETRY: FAILED ==========');
+                this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'error', `Auto-retry could not complete: ${retryResult.error}`);
+                
+                nodeState.error = `Auto-retry failed: ${retryResult.error}`;
+                
+                if (retryResult.metrics) {
+                  nodeState.metrics = retryResult.metrics;
+                }
+                if (retryResult.phaseMetrics) {
+                  nodeState.phaseMetrics = { ...nodeState.phaseMetrics, ...retryResult.phaseMetrics };
+                }
+                
+                // Record retry attempt in history
+                const retryAttempt: AttemptRecord = {
+                  attemptNumber: nodeState.attempts,
+                  triggerType: 'auto-heal',
+                  status: 'failed',
+                  startedAt: nodeState.startedAt || Date.now(),
+                  endedAt: Date.now(),
+                  failedPhase: retryResult.failedPhase,
+                  error: retryResult.error,
+                  exitCode: retryResult.exitCode,
+                  copilotSessionId: nodeState.copilotSessionId,
+                  stepStatuses: nodeState.stepStatuses ? { ...nodeState.stepStatuses } : undefined,
+                  worktreePath: nodeState.worktreePath,
+                  baseCommit: nodeState.baseCommit,
+                  logs: this.getNodeLogsFromOffset(plan.id, node.id, retryLogMemoryOffset, retryLogFileOffset),
+                  workUsed: node.work,
+                  metrics: nodeState.metrics,
+                  phaseMetrics: nodeState.phaseMetrics ? { ...nodeState.phaseMetrics } : undefined,
+                };
+                nodeState.attemptHistory = [...(nodeState.attemptHistory || []), retryAttempt];
+                
+                sm.transition(node.id, 'failed');
+                this.emit('nodeCompleted', plan.id, node.id, false);
+                
+                log.error(`Job failed (after auto-retry): ${node.name}`, {
+                  planId: plan.id,
+                  nodeId: node.id,
+                  error: retryResult.error,
+                });
+                return;
+              }
+            } else {
+            // Non-agent work failed — existing auto-heal logic (swap to agent)
             log.info(`Auto-heal: attempting AI-assisted fix for ${node.name} (phase: ${failedPhase})`, {
               planId: plan.id,
               nodeId: node.id,
               exitCode: result.exitCode,
             });
-            
-            if (!nodeState.autoHealAttempted) nodeState.autoHealAttempted = {};
-            nodeState.autoHealAttempted[failedPhase as 'prechecks' | 'work' | 'postchecks'] = true;
             
             // Log the auto-heal attempt in the failed phase's log stream
             this.execLog(plan.id, node.id, failedPhase as ExecutionPhase, 'info', '');
@@ -1679,6 +1874,10 @@ export class PlanRunner extends EventEmitter {
             nodeState.error = undefined;
             nodeState.startedAt = Date.now();
             nodeState.attempts++;
+            
+            // Capture log offsets for the auto-heal attempt
+            const healLogMemoryOffset = this.executor?.getLogs?.(plan.id, node.id)?.length ?? 0;
+            const healLogFileOffset = this.executor?.getLogFileSize?.(plan.id, node.id) ?? 0;
             
             // Execute with resumeFromPhase to skip already-passed phases
             const healContext: ExecutionContext = {
@@ -1772,7 +1971,7 @@ export class PlanRunner extends EventEmitter {
                 stepStatuses: nodeState.stepStatuses ? { ...nodeState.stepStatuses } : undefined,
                 worktreePath: nodeState.worktreePath,
                 baseCommit: nodeState.baseCommit,
-                logs: this.getNodeLogs(plan.id, node.id),
+                logs: this.getNodeLogsFromOffset(plan.id, node.id, healLogMemoryOffset, healLogFileOffset),
                 workUsed: healSpec,
                 metrics: nodeState.metrics,
                 phaseMetrics: nodeState.phaseMetrics ? { ...nodeState.phaseMetrics } : undefined,
@@ -1788,6 +1987,7 @@ export class PlanRunner extends EventEmitter {
                 error: healResult.error,
               });
               return;
+            }
             }
           } else {
             // No auto-heal — transition to failed normally
@@ -1878,7 +2078,7 @@ export class PlanRunner extends EventEmitter {
           worktreePath: nodeState.worktreePath,
           baseCommit: nodeState.baseCommit,
           completedCommit: nodeState.completedCommit, // Work was successful, so we have the commit
-          logs: this.getNodeLogs(plan.id, node.id),
+          logs: this.getNodeLogsFromOffset(plan.id, node.id, logMemoryOffset, logFileOffset),
           workUsed: node.work,
           metrics: nodeState.metrics,
           phaseMetrics: nodeState.phaseMetrics ? { ...nodeState.phaseMetrics } : undefined,
@@ -1906,7 +2106,7 @@ export class PlanRunner extends EventEmitter {
           stepStatuses: nodeState.stepStatuses ? { ...nodeState.stepStatuses } : undefined,
           worktreePath: nodeState.worktreePath,
           baseCommit: nodeState.baseCommit,
-          logs: this.getNodeLogs(plan.id, node.id),
+          logs: this.getNodeLogsFromOffset(plan.id, node.id, logMemoryOffset, logFileOffset),
           workUsed: node.work,
           metrics: nodeState.metrics,
           phaseMetrics: nodeState.phaseMetrics ? { ...nodeState.phaseMetrics } : undefined,
@@ -1965,7 +2165,7 @@ export class PlanRunner extends EventEmitter {
         stepStatuses: nodeState.stepStatuses,
         worktreePath: nodeState.worktreePath,
         baseCommit: nodeState.baseCommit,
-        logs: this.getNodeLogs(plan.id, node.id),
+        logs: this.getNodeLogsFromOffset(plan.id, node.id, logMemoryOffset, logFileOffset),
         workUsed: node.work,
         metrics: nodeState.metrics,
         phaseMetrics: nodeState.phaseMetrics,
