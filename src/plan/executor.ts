@@ -133,8 +133,9 @@ export class DefaultJobExecutor implements JobExecutor {
    * @returns Result with success/failure, optional commit SHA, and per-phase statuses.
    */
   async execute(context: ExecutionContext): Promise<JobExecutionResult> {
-    const { plan, node, worktreePath } = context;
-    const executionKey = `${plan.id}:${node.id}`;
+    const { plan, node, worktreePath, attemptNumber } = context;
+    // Include attempt number in execution key for separate log files per attempt
+    const executionKey = `${plan.id}:${node.id}:${attemptNumber}`;
     
     // Track this execution
     const execution: ActiveExecution = {
@@ -267,6 +268,7 @@ export class DefaultJobExecutor implements JobExecutor {
         if (!workResult.success) {
           stepStatuses.work = 'failed';
           context.onStepStatusChange?.('work', 'failed');
+          log.info(`[executor.execute] Returning failure: ${workResult.error}`, { planId: plan.id, nodeId: node.id });
           return {
             success: false,
             error: `Work failed: ${workResult.error}`,
@@ -504,7 +506,7 @@ export class DefaultJobExecutor implements JobExecutor {
    */
   getLogFileSize(planId: string, nodeId: string): number {
     const executionKey = `${planId}:${nodeId}`;
-    const logFile = this.getLogFilePath(executionKey);
+    const logFile = this.getLogFilePathByKey(executionKey);
     if (!logFile || !fs.existsSync(logFile)) return 0;
     try {
       return fs.statSync(logFile).size;
@@ -661,9 +663,10 @@ export class DefaultJobExecutor implements JobExecutor {
    * @param phase   - Current execution phase.
    * @param type    - Log level.
    * @param message - Log message text.
+   * @param attemptNumber - Optional attempt number for per-attempt log files.
    */
-  log(planId: string, nodeId: string, phase: ExecutionPhase, type: 'info' | 'error' | 'stdout' | 'stderr', message: string): void {
-    const executionKey = `${planId}:${nodeId}`;
+  log(planId: string, nodeId: string, phase: ExecutionPhase, type: 'info' | 'error' | 'stdout' | 'stderr', message: string, attemptNumber?: number): void {
+    const executionKey = attemptNumber ? `${planId}:${nodeId}:${attemptNumber}` : `${planId}:${nodeId}`;
     
     // Ensure logs array exists
     if (!this.executionLogs.has(executionKey)) {
@@ -766,10 +769,13 @@ export class DefaultJobExecutor implements JobExecutor {
       let stderr = '';
       let timeoutHandle: NodeJS.Timeout | undefined;
       
-      // Set timeout if specified
-      if (spec.timeout) {
+      // Set timeout only when explicitly specified (> 0)
+      // Omitting timer when no timeout prevents keeping the event loop alive unnecessarily
+      const effectiveTimeout = spec.timeout && spec.timeout > 0
+        ? Math.min(spec.timeout, 2147483647) : 0;
+      if (effectiveTimeout > 0) {
         timeoutHandle = setTimeout(() => {
-          this.logError(executionKey, phase, `Process timed out after ${spec.timeout}ms (PID: ${proc.pid})`);
+          this.logError(executionKey, phase, `Process timed out after ${effectiveTimeout}ms (PID: ${proc.pid})`);
           try {
             if (process.platform === 'win32') {
               spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
@@ -777,10 +783,8 @@ export class DefaultJobExecutor implements JobExecutor {
               proc.kill('SIGTERM');
             }
           } catch (e) { /* ignore */ }
-        }, spec.timeout);
+        }, effectiveTimeout);
       }
-      
-      proc.stdout?.setEncoding('utf8');
       proc.stderr?.setEncoding('utf8');
       
       proc.stdout?.on('data', (data: string) => {
@@ -899,10 +903,12 @@ export class DefaultJobExecutor implements JobExecutor {
       let stderr = '';
       let timeoutHandle: NodeJS.Timeout | undefined;
       
-      // Set timeout if specified
-      if (spec.timeout) {
+      // Set timeout only when explicitly specified (> 0)
+      const effectiveTimeout = spec.timeout && spec.timeout > 0
+        ? Math.min(spec.timeout, 2147483647) : 0;
+      if (effectiveTimeout > 0) {
         timeoutHandle = setTimeout(() => {
-          this.logError(executionKey, phase, `Shell command timed out after ${spec.timeout}ms (PID: ${proc.pid})`);
+          this.logError(executionKey, phase, `Shell command timed out after ${effectiveTimeout}ms (PID: ${proc.pid})`);
           try {
             if (process.platform === 'win32') {
               spawn('taskkill', ['/pid', String(proc.pid), '/f', '/t']);
@@ -910,7 +916,7 @@ export class DefaultJobExecutor implements JobExecutor {
               proc.kill('SIGTERM');
             }
           } catch (e) { /* ignore */ }
-        }, spec.timeout);
+        }, effectiveTimeout);
       }
       
       proc.stdout?.setEncoding('utf8');
@@ -1509,9 +1515,34 @@ export class DefaultJobExecutor implements JobExecutor {
   // ============================================================================
   
   /**
-   * Get or create log file path for an execution
+   * Get or create log file path for an execution.
+   * 
+   * @param planId - Plan identifier.
+   * @param nodeId - Node identifier.
+   * @param attemptNumber - Optional 1-based attempt number. If provided, returns path for specific attempt.
+   * @returns Absolute path to the log file, or undefined if no storage path.
    */
-  private getLogFilePath(executionKey: string): string | undefined {
+  getLogFilePath(planId: string, nodeId: string, attemptNumber?: number): string | undefined {
+    if (!this.storagePath) return undefined;
+    
+    // Include attempt number in key if provided
+    const executionKey = attemptNumber 
+      ? `${planId}:${nodeId}:${attemptNumber}`
+      : `${planId}:${nodeId}`;
+    let logFile = this.logFiles.get(executionKey);
+    if (!logFile) {
+      const logsDir = path.join(this.storagePath, 'logs');
+      const safeKey = executionKey.replace(/[^a-zA-Z0-9-_]/g, '_');
+      logFile = path.join(logsDir, `${safeKey}.log`);
+      this.logFiles.set(executionKey, logFile);
+    }
+    return logFile;
+  }
+
+  /**
+   * Internal method to get log file path from execution key.
+   */
+  private getLogFilePathByKey(executionKey: string): string | undefined {
     if (!this.storagePath) return undefined;
     
     let logFile = this.logFiles.get(executionKey);
@@ -1528,7 +1559,7 @@ export class DefaultJobExecutor implements JobExecutor {
    * Append a log entry to file
    */
   private appendToLogFile(executionKey: string, entry: LogEntry): void {
-    const logFile = this.getLogFilePath(executionKey);
+    const logFile = this.getLogFilePathByKey(executionKey);
     if (!logFile) return;
     
     try {
@@ -1546,9 +1577,9 @@ export class DefaultJobExecutor implements JobExecutor {
   /**
    * Read logs from file for a completed execution
    */
-  readLogsFromFile(planId: string, nodeId: string): string {
-    const executionKey = `${planId}:${nodeId}`;
-    const logFile = this.getLogFilePath(executionKey);
+  readLogsFromFile(planId: string, nodeId: string, attemptNumber?: number): string {
+    const executionKey = attemptNumber ? `${planId}:${nodeId}:${attemptNumber}` : `${planId}:${nodeId}`;
+    const logFile = this.getLogFilePathByKey(executionKey);
     
     if (!logFile || !fs.existsSync(logFile)) {
       return 'No log file found.';
@@ -1565,9 +1596,9 @@ export class DefaultJobExecutor implements JobExecutor {
    * Read logs from file starting at a byte offset.
    * Used to capture only the logs produced during the current attempt.
    */
-  readLogsFromFileOffset(planId: string, nodeId: string, byteOffset: number): string {
-    const executionKey = `${planId}:${nodeId}`;
-    const logFile = this.getLogFilePath(executionKey);
+  readLogsFromFileOffset(planId: string, nodeId: string, byteOffset: number, attemptNumber?: number): string {
+    const executionKey = attemptNumber ? `${planId}:${nodeId}:${attemptNumber}` : `${planId}:${nodeId}`;
+    const logFile = this.getLogFilePathByKey(executionKey);
 
     if (!logFile) {
       return 'No log file found.';
