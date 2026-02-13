@@ -1131,6 +1131,17 @@ export async function handleUpdatePlanNode(args: any, ctx: PlanHandlerContext): 
   }
   const jobNode = node as JobNode;
   
+  // Check if node is currently running or scheduled - cannot update while executing
+  const nodeState = plan.nodeStates.get(args.nodeId);
+  if (nodeState?.status === 'running' || nodeState?.status === 'scheduled') {
+    return errorResult(`Node "${jobNode.name}" is currently ${nodeState.status} and cannot be updated. Wait for it to complete or force-fail it first.`);
+  }
+  
+  // Check if node has already completed successfully - cannot update completed nodes
+  if (nodeState?.status === 'succeeded') {
+    return errorResult(`Node "${jobNode.name}" has already completed successfully and cannot be updated.`);
+  }
+  
   // Apply spec updates directly to the node
   if (args.work !== undefined) {
     jobNode.work = normalizeWorkSpec(args.work);
@@ -1143,7 +1154,6 @@ export async function handleUpdatePlanNode(args: any, ctx: PlanHandlerContext): 
   }
   
   // Handle resetToStage: clear step statuses from that stage onward
-  const nodeState = plan.nodeStates.get(args.nodeId);
   if (nodeState) {
     const stageOrder = ['prechecks', 'work', 'postchecks'] as const;
     const resetTo = args.resetToStage || ('work' in args ? 'work' : 'prechecks' in args ? 'prechecks' : 'postchecks');
