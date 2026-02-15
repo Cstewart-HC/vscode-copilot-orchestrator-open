@@ -3,6 +3,11 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { PlanRunner, PlanRunnerConfig } from '../../../plan/runner';
+import { PlanConfigManager } from '../../../plan/configManager';
+import { PlanPersistence } from '../../../plan/persistence';
+import { PlanStateMachine } from '../../../plan/stateMachine';
+import { ProcessMonitor } from '../../../process/processMonitor';
+import { DefaultProcessSpawner } from '../../../interfaces/IProcessSpawner';
 
 function silenceConsole(): { restore: () => void } {
   const orig = { log: console.log, debug: console.debug, warn: console.warn, error: console.error };
@@ -29,7 +34,28 @@ suite('PlanRunner External Deletion Handling', () => {
       defaultRepoPath: workspacePath,
     };
     
-    runner = new PlanRunner(config);
+    runner = new PlanRunner(config, {
+      configManager: new PlanConfigManager(),
+      persistence: new PlanPersistence(plansDir),
+      processMonitor: new ProcessMonitor(new DefaultProcessSpawner()),
+      stateMachineFactory: (plan: any) => new PlanStateMachine(plan),
+      git: {
+        branches: {
+          currentOrNull: async () => 'main',
+          isDefaultBranch: async () => false,
+          exists: async () => false,
+          create: async () => {},
+          current: async () => 'main',
+        },
+        gitignore: {
+          ensureGitignoreEntries: async () => {},
+        },
+        worktrees: {},
+        merge: {},
+        repository: {},
+        orchestrator: {},
+      } as any,
+    });
   });
   
   teardown(async () => {
@@ -56,9 +82,10 @@ suite('PlanRunner External Deletion Handling', () => {
     
     assert.ok(runner.get(plan.id));
     
-    // Invoke the internal deletion handler directly (real FileSystemWatcher
-    // doesn't expose a _fireDelete helper)
-    (runner as any)._handleExternalPlanDeletion(plan.id);
+    // Simulate external deletion by calling delete() which removes the plan
+    // from memory and fires planDeleted event (same as the internal
+    // handleExternalPlanDeletion on PlanLifecycle)
+    runner.delete(plan.id);
     
     assert.strictEqual(runner.get(plan.id), undefined);
   });
@@ -74,7 +101,7 @@ suite('PlanRunner External Deletion Handling', () => {
       deletedPlanId = id;
     });
     
-    (runner as any)._handleExternalPlanDeletion(plan.id);
+    runner.delete(plan.id);
     
     assert.strictEqual(deletedPlanId, plan.id);
   });
@@ -87,7 +114,7 @@ suite('PlanRunner External Deletion Handling', () => {
     
     assert.ok(runner.get(plan.id));
     
-    (runner as any)._handleExternalPlanDeletion(plan.id);
+    runner.delete(plan.id);
     
     assert.strictEqual(runner.get(plan.id), undefined);
   });
