@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @fileoverview Unit tests for MergeFiPhaseExecutor
  */
 
@@ -133,6 +133,7 @@ function mockGitOperations(): IGitOperations {
       isIgnored: sinon.stub().resolves(false),
       isOrchestratorGitIgnoreConfigured: sinon.stub().resolves(true),
       ensureOrchestratorGitIgnore: sinon.stub().resolves(true),
+    isDiffOnlyOrchestratorChanges: sinon.stub().returns(true),
     },
   };
 }
