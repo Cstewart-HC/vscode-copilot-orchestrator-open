@@ -36,20 +36,22 @@ export interface ConfigData {
   instructions?: string;
   /** Current execution phase */
   currentPhase?: string;
+  /** Original instructions before augmentation (when augmented) */
+  originalInstructions?: string;
 }
 
 /**
  * Get spec type info for badge display
  */
 export function getSpecTypeInfo(spec: WorkSpec | undefined): { type: string; label: string } {
-  if (!spec) return { type: 'none', label: 'None' };
+  if (!spec) {return { type: 'none', label: 'None' };}
   
   if (typeof spec === 'string') {
     return { type: 'shell', label: 'Shell' };
   }
 
   const normalized = normalizeWorkSpec(spec);
-  if (!normalized) return { type: 'none', label: 'None' };
+  if (!normalized) {return { type: 'none', label: 'None' };}
 
   switch (normalized.type) {
     case 'agent': {
@@ -71,14 +73,14 @@ export function getSpecTypeInfo(spec: WorkSpec | undefined): { type: string; lab
  * Render spec content as HTML
  */
 export function renderSpecContent(spec: WorkSpec | undefined): string {
-  if (!spec) return '<div class="spec-empty">No specification defined</div>';
+  if (!spec) {return '<div class="spec-empty">No specification defined</div>';}
   
   if (typeof spec === 'string') {
     return `<div class="spec-content"><pre class="spec-code"><code>${escapeHtml(spec)}</code></pre></div>`;
   }
 
   const normalized = normalizeWorkSpec(spec);
-  if (!normalized) return '<div class="spec-empty">Invalid specification</div>';
+  if (!normalized) {return '<div class="spec-empty">Invalid specification</div>';}
 
   switch (normalized.type) {
     case 'agent':
@@ -229,10 +231,28 @@ export function configSectionHtml(data: ConfigData): string {
 
   // Instructions (if provided)
   if (data.instructions) {
+    const augmentedBadge = data.originalInstructions
+      ? ' <span class="phase-type-badge agent" style="margin-left: 6px;">✨ Augmented</span>'
+      : '';
     configContent += `
       <div class="config-item">
-        <div class="config-label">Instructions</div>
+        <div class="config-label">Instructions${augmentedBadge}</div>
         <div class="config-value">${escapeHtml(data.instructions)}</div>
+      </div>
+    `;
+  }
+
+  // Original instructions (collapsible, shown when augmentation occurred)
+  if (data.originalInstructions) {
+    configContent += `
+      <div class="config-phase">
+        <div class="config-phase-header collapsed config-collapsible-toggle" data-phase="original-instructions">
+          <span class="chevron">▶</span>
+          <span class="phase-label">View Original</span>
+        </div>
+        <div class="config-phase-body" style="display:none">
+          <div class="config-value">${escapeHtml(data.originalInstructions)}</div>
+        </div>
       </div>
     `;
   }
@@ -280,7 +300,7 @@ export function gitInfoSectionHtml(data: {
   targetBranch?: string;    // NEW
   mergedToTarget?: boolean; // NEW
 }): string {
-  if (!data.worktreePath && !data.baseCommit && !data.completedCommit && !data.workCommit && !data.baseBranch && !data.targetBranch && data.mergedToTarget === undefined) return '';
+  if (!data.worktreePath && !data.baseCommit && !data.completedCommit && !data.workCommit && !data.baseBranch && !data.targetBranch && data.mergedToTarget === undefined) {return '';}
 
   return `<!-- Git Information -->
   <div class="section">

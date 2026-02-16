@@ -217,6 +217,11 @@ export function webviewScripts(config: ScriptsConfig): string {
             phaseEl.style.display = 'none';
           }
         }
+        // Toggle force-fail button visibility
+        var ffBtn = document.getElementById('forceFailBtn');
+        if (ffBtn) {
+          ffBtn.style.display = (data.status === 'running') ? '' : 'none';
+        }
         this.publishUpdate(data);
       };
       return SBC;
@@ -603,10 +608,14 @@ export function webviewScripts(config: ScriptsConfig): string {
         // Work (always expanded, not collapsible)
         if (cfg.work) {
           var workType = cfg.workType || { type: 'agent', label: 'Agent' };
+          var augBadge = cfg.originalInstructions
+            ? ' <span class="phase-type-badge agent" style="margin-left: 4px;">✨ Augmented</span>'
+            : '';
           phasesHtml += '<div class="config-phase">'
             + '<div class="config-phase-header non-collapsible">'
             + '<span class="phase-label">Work</span>'
             + '<span class="phase-type-badge ' + (workType.type || '').toLowerCase() + '">' + escapeHtml(workType.label) + '</span>'
+            + augBadge
             + '</div>'
             + '<div class="config-phase-body">' + cfg.work + '</div>'
             + '</div>';
@@ -625,7 +634,21 @@ export function webviewScripts(config: ScriptsConfig): string {
         var html = '<div class="section"><h3>Job Configuration</h3>'
           + '<div class="config-item"><div class="config-label">Task</div>'
           + '<div class="config-value">' + escapeHtml(cfg.task || '') + '</div></div>'
-          + '<div class="config-phases">' + phasesHtml + '</div></div>';
+          + '<div class="config-phases">' + phasesHtml + '</div>';
+
+        // Original instructions: augmented badge + collapsible View Original
+        if (cfg.originalInstructions) {
+          html += '<div class="config-phase">'
+            + '<div class="config-phase-header collapsed config-collapsible-toggle" data-phase="original-instructions">'
+            + '<span class="chevron">▶</span>'
+            + '<span class="phase-label">View Original</span>'
+            + '</div>'
+            + '<div class="config-phase-body" style="display:none">'
+            + '<div class="config-value">' + escapeHtml(cfg.originalInstructions) + '</div>'
+            + '</div></div>';
+        }
+
+        html += '</div>';
 
         el.innerHTML = html;
         this._bindCollapsibleHandlers(el);
@@ -738,7 +761,7 @@ export function webviewScripts(config: ScriptsConfig): string {
     // ── Retry / force-fail button handlers ──────────────────────────────
     document.body.addEventListener('click', function(e) {
       if (!(e.target instanceof Element)) return;
-      var btn = e.target.closest('.retry-btn');
+      var btn = e.target.closest('.retry-btn') || e.target.closest('.force-fail-btn');
       if (!btn) return;
 
       var action = btn.getAttribute('data-action');

@@ -114,7 +114,7 @@ export class JobExecutionEngine {
     node: JobNode
   ): Promise<void> {
     const nodeState = plan.nodeStates.get(node.id);
-    if (!nodeState) return;
+    if (!nodeState) {return;}
     
     this.log.info(`Executing job node: ${node.name}`, {
       planId: plan.id,
@@ -175,7 +175,7 @@ export class JobExecutionEngine {
       } catch (wtError: any) {
         // Worktree creation is part of FI phase - log and set correct phase
         this.execLog(plan.id, node.id, 'merge-fi', 'error', `Failed to create worktree: ${wtError.message}`, nodeState.attempts);
-        if (!nodeState.stepStatuses) nodeState.stepStatuses = {};
+        if (!nodeState.stepStatuses) {nodeState.stepStatuses = {};}
         nodeState.stepStatuses['merge-fi'] = 'failed';
         const fiError = new Error(wtError.message) as Error & { failedPhase: string };
         fiError.failedPhase = 'merge-fi';
@@ -206,17 +206,9 @@ export class JobExecutionEngine {
           this.log.warn(`Slow worktree creation for ${node.name} took ${timing.totalMs}ms`);
         }
         
-        // Ensure .gitignore includes orchestrator temp files
-        try {
-          const modified = await this.git.gitignore.ensureGitignoreEntries(worktreePath);
-          if (modified) {
-            this.log.debug(`Updated .gitignore in worktree: ${worktreePath}`);
-            // Stage the gitignore change so it's included in the work commit
-            await this.git.repository.stageFile(worktreePath, '.gitignore');
-          }
-        } catch (err: any) {
-          this.log.warn(`Failed to update .gitignore: ${err.message}`);
-        }
+        // Note: .gitignore management is handled at the repo level (planInitialization.ts),
+        // not per-worktree. Modifying .gitignore here would block FI merges when
+        // dependency commits also touch .gitignore.
       }
       
       // Acknowledge consumption to all dependencies
@@ -266,7 +258,7 @@ export class JobExecutionEngine {
             this.log.debug(`Job progress: ${node.name} - ${step}`);
           },
           onStepStatusChange: (phase, status) => {
-            if (!nodeState.stepStatuses) nodeState.stepStatuses = {};
+            if (!nodeState.stepStatuses) {nodeState.stepStatuses = {};}
             (nodeState.stepStatuses as any)[phase] = status;
           },
         };
@@ -429,7 +421,7 @@ export class JobExecutionEngine {
           this.state.persistence.save(plan);
           
           if (shouldAttemptAutoRetry) {
-            if (!nodeState.autoHealAttempted) nodeState.autoHealAttempted = {};
+            if (!nodeState.autoHealAttempted) {nodeState.autoHealAttempted = {};}
             nodeState.autoHealAttempted[failedPhase as 'prechecks' | 'work' | 'postchecks'] = true;
             
             if (isAgentWork && wasExternallyKilled) {
@@ -454,6 +446,7 @@ export class JobExecutionEngine {
               const retryLogFileOffset = this.state.executor?.getLogFileSize?.(plan.id, node.id) ?? 0;
 
               // Execute with resumeFromPhase to skip already-passed phases
+              // Critical: preserve merge-specific fields so RI merge runs for leaf nodes
               const retryContext: ExecutionContext = {
                 plan,
                 node,
@@ -463,11 +456,16 @@ export class JobExecutionEngine {
                 copilotSessionId: nodeState.copilotSessionId,
                 resumeFromPhase: failedPhase as ExecutionContext['resumeFromPhase'],
                 previousStepStatuses: nodeState.stepStatuses,
+                // Merge-specific fields (must match original context)
+                dependencyCommits: dependencyCommits.length > 0 ? dependencyCommits : undefined,
+                repoPath: plan.repoPath,
+                targetBranch: plan.leaves.includes(node.id) ? plan.targetBranch : undefined,
+                baseCommitAtStart: plan.baseCommitAtStart,
                 onProgress: (step) => {
                   this.log.debug(`Auto-retry progress: ${node.name} - ${step}`);
                 },
                 onStepStatusChange: (phase, status) => {
-                  if (!nodeState.stepStatuses) nodeState.stepStatuses = {};
+                  if (!nodeState.stepStatuses) {nodeState.stepStatuses = {};}
                   (nodeState.stepStatuses as any)[phase] = status;
                 },
               };
@@ -587,9 +585,9 @@ export class JobExecutionEngine {
             // 2. The full execution logs (stdout/stderr) from the failed phase
             const originalCommand = (() => {
               const spec = normalizeWorkSpec(failedWorkSpec);
-              if (!spec) return 'Unknown command';
-              if (spec.type === 'shell') return spec.command;
-              if (spec.type === 'process') return `${spec.executable} ${(spec.args || []).join(' ')}`;
+              if (!spec) {return 'Unknown command';}
+              if (spec.type === 'shell') {return spec.command;}
+              if (spec.type === 'process') {return `${spec.executable} ${(spec.args || []).join(' ')}`;}
               return 'Unknown command';
             })();
             
@@ -647,10 +645,16 @@ export class JobExecutionEngine {
             }
 
             // The heal spec is minimal — the real instructions are in the .md file
+            // Add the .orchestrator/logs dir as an allowed folder so the agent can read log files
+            const logsDir = plan.repoPath ? path.resolve(plan.repoPath, '.orchestrator', 'logs') : undefined;
+            const healAllowedFolders = [
+              ...(originalAgentSpec?.allowedFolders || []),
+              ...(logsDir ? [logsDir] : []),
+            ];
             const healSpec: WorkSpec = {
               type: 'agent',
               instructions: 'Fix the error described in the heal instructions file. Read the log file, diagnose the failure, fix it, and re-run the command.',
-              allowedFolders: originalAgentSpec?.allowedFolders,
+              allowedFolders: healAllowedFolders.length > 0 ? healAllowedFolders : undefined,
               allowedUrls: originalAgentSpec?.allowedUrls,
             };
             
@@ -678,6 +682,7 @@ export class JobExecutionEngine {
             const healLogFileOffset = this.state.executor?.getLogFileSize?.(plan.id, node.id) ?? 0;
             
             // Execute with resumeFromPhase to skip already-passed phases
+            // Critical: preserve merge-specific fields so RI merge runs for leaf nodes
             const healContext: ExecutionContext = {
               plan,
               node,
@@ -687,11 +692,16 @@ export class JobExecutionEngine {
               copilotSessionId: nodeState.copilotSessionId,
               resumeFromPhase: failedPhase as ExecutionContext['resumeFromPhase'],
               previousStepStatuses: nodeState.stepStatuses,
+              // Merge-specific fields (must match original context)
+              dependencyCommits: dependencyCommits.length > 0 ? dependencyCommits : undefined,
+              repoPath: plan.repoPath,
+              targetBranch: plan.leaves.includes(node.id) ? plan.targetBranch : undefined,
+              baseCommitAtStart: plan.baseCommitAtStart,
               onProgress: (step) => {
                 this.log.debug(`Auto-heal progress: ${node.name} - ${step}`);
               },
               onStepStatusChange: (phase, status) => {
-                if (!nodeState.stepStatuses) nodeState.stepStatuses = {};
+                if (!nodeState.stepStatuses) {nodeState.stepStatuses = {};}
                 (nodeState.stepStatuses as any)[phase] = status;
               },
             };
@@ -827,14 +837,21 @@ export class JobExecutionEngine {
       if (isLeaf && plan.targetBranch) {
         // The executor's merge-ri phase will handle reverse integration
         // We'll check the nodeState step status to determine if RI succeeded
-        const riSuccess = nodeState.stepStatuses?.['merge-ri'] === 'success';
+        const riStatus = nodeState.stepStatuses?.['merge-ri'];
+        const riSuccess = riStatus === 'success';
         nodeState.mergedToTarget = riSuccess;
+        
+        // Detect when RI merge was unexpectedly skipped for a leaf node
+        if (riStatus === 'skipped' || !riStatus) {
+          this.log.warn(`RI merge was ${riStatus || 'missing'} for leaf node ${node.name} — expected success or failure`);
+        }
       } else {
         nodeState.mergedToTarget = true; // No merge needed
       }
       
-      // Check if RI merge failed based on executor result
-      const riMergeFailed = isLeaf && plan.targetBranch && nodeState.stepStatuses?.['merge-ri'] === 'failed';
+      // Check if RI merge failed or was unexpectedly skipped
+      const riMergeFailed = isLeaf && plan.targetBranch && 
+        (nodeState.stepStatuses?.['merge-ri'] === 'failed' || nodeState.stepStatuses?.['merge-ri'] === 'skipped');
       
       // If RI merge failed, treat the node as failed (work succeeded but merge did not)
       if (riMergeFailed) {
@@ -1119,17 +1136,23 @@ export class JobExecutionEngine {
           try {
             await this.git.repository.stashPop(repoPath, s => this.log.debug(s));
           } catch (popErr: any) {
-            // Pop failed - check if it's just orchestrator .gitignore conflict
             this.log.warn(`Stash pop failed: ${popErr.message}`);
             
-            // Check stash contents - if only orchestrator .gitignore, drop it
-            const stashOnlyOrchestratorGitignore = await this.isStashOnlyOrchestratorGitignore(repoPath);
-            if (stashOnlyOrchestratorGitignore) {
-              this.log.debug(`Stash contains only orchestrator .gitignore changes - dropping`);
+            // Check if stash is only orchestrator changes (safe to drop)
+            const stashOnlyOrchestrator = await this.isStashOnlyOrchestratorGitignore(repoPath);
+            if (stashOnlyOrchestrator) {
+              this.log.debug(`Stash contains only orchestrator changes - dropping`);
               await this.git.repository.stashDrop(repoPath, undefined, s => this.log.debug(s));
             } else {
-              // Stash has real user changes - leave it for user to resolve
-              this.log.warn(`Stash contains user changes that couldn't be applied. Run 'git stash pop' to recover.`);
+              // Stash has real user changes - attempt to resolve conflicts
+              const conflicts = await this.git.merge.listConflicts(repoPath).catch(() => []);
+              if (conflicts.length > 0) {
+                this.log.info(`Stash pop has ${conflicts.length} conflict(s), leaving for user to resolve`);
+                this.log.warn(`User changes stashed before RI merge could not be auto-restored.`);
+                this.log.warn(`Run 'git checkout --theirs . && git add .' to keep merged state, or 'git stash pop' to retry.`);
+              } else {
+                this.log.warn(`Stash pop failed but no conflicts detected. Run 'git stash pop' to recover.`);
+              }
             }
           }
         } catch (err) {
@@ -1166,7 +1189,7 @@ export class JobExecutionEngine {
       const result = await this.git.repository.getFileDiff(repoPath, '.gitignore');
       if (!result || !result.trim()) {
         const stagedResult = await this.git.repository.getStagedFileDiff(repoPath, '.gitignore');
-        if (!stagedResult || !stagedResult.trim()) return true;
+        if (!stagedResult || !stagedResult.trim()) {return true;}
         return this.git.gitignore.isDiffOnlyOrchestratorChanges(stagedResult);
       }
       return this.git.gitignore.isDiffOnlyOrchestratorChanges(result);
@@ -1181,9 +1204,9 @@ export class JobExecutionEngine {
   private async isStashOnlyOrchestratorGitignore(repoPath: string): Promise<boolean> {
     try {
       const files = await this.git.repository.stashShowFiles(repoPath);
-      if (files.length !== 1 || files[0] !== '.gitignore') return false;
+      if (files.length !== 1 || files[0] !== '.gitignore') {return false;}
       const diffResult = await this.git.repository.stashShowPatch(repoPath);
-      if (!diffResult) return false;
+      if (!diffResult) {return false;}
       return this.git.gitignore.isDiffOnlyOrchestratorChanges(diffResult);
     } catch {
       return false;
@@ -1241,9 +1264,9 @@ export class JobExecutionEngine {
     }
     
     const parts: string[] = [];
-    if (added > 0) parts.push(`+${added}`);
-    if (modified > 0) parts.push(`~${modified}`);
-    if (deleted > 0) parts.push(`-${deleted}`);
+    if (added > 0) {parts.push(`+${added}`);}
+    if (modified > 0) {parts.push(`~${modified}`);}
+    if (deleted > 0) {parts.push(`-${deleted}`);}
     
     const summary = parts.join(' ');
     
@@ -1344,7 +1367,7 @@ export class JobExecutionEngine {
       }
       
       const node = plan.nodes.get(nodeId);
-      if (!node) continue;
+      if (!node) {continue;}
       
       // Check if all consumers have consumed this node's output
       const consumersReady = this.allConsumersConsumed(plan, node, state);

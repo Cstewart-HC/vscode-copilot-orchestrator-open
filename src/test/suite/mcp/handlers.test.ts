@@ -18,7 +18,6 @@ import {
   handleRetryPlanNode,
   handleGetNodeFailureContext,
   handleCreatePlan,
-  handleCreateJob,
   PlanHandlerContext,
 } from '../../../mcp/handlers';
 import { PlanInstance, NodeExecutionState, JobNode, GroupInstance, GroupExecutionState } from '../../../plan/types';
@@ -103,7 +102,7 @@ function createContext(plans: PlanInstance[] = []): PlanHandlerContext {
       getPlans: sinon.stub().returns(plans),
       getStatus: sinon.stub().callsFake((id: string) => {
         const p = planMap.get(id);
-        if (!p) return undefined;
+        if (!p) {return undefined;}
         return { plan: p, status: 'running', counts: { running: 1, succeeded: 0, failed: 0, pending: 0, ready: 0, scheduled: 0, blocked: 0, canceled: 0 }, progress: 0 };
       }),
       getStateMachine: sinon.stub().returns(null),
@@ -678,77 +677,6 @@ suite('MCP Handlers', () => {
       const result = await handleCreatePlan({
         name: 'Plan',
         jobs: [{ producer_id: 'job-a', task: 'test', dependencies: [] }],
-      }, ctx);
-      assert.strictEqual(result.success, false);
-    });
-  });
-
-  // =========================================================================
-  // handleCreateJob
-  // =========================================================================
-
-  suite('handleCreateJob', () => {
-    test('returns error when name missing', async () => {
-      const ctx = createContext();
-      const result = await handleCreateJob({}, ctx);
-      assert.strictEqual(result.success, false);
-    });
-
-    test('returns error when task missing', async () => {
-      const ctx = createContext();
-      const result = await handleCreateJob({ name: 'Job' }, ctx);
-      assert.strictEqual(result.success, false);
-    });
-
-    test('creates job successfully', async () => {
-      const mockPlan = createTestPlan();
-      const ctx = createContext();
-      (ctx.PlanRunner as any).enqueueJob = sinon.stub().returns(mockPlan);
-      const git = require('../../../git');
-      sinon.stub(git.branches, 'currentOrNull').resolves('main');
-      sinon.stub(git.orchestrator, 'resolveTargetBranchRoot').resolves({ targetBranchRoot: 'copilot_plan/test', needsCreation: false });
-      const vscode = require('vscode');
-      sinon.stub(vscode.workspace, 'getConfiguration').returns({ get: (key: string, def: any) => def });
-      const result = await handleCreateJob({
-        name: 'My Job',
-        task: 'Do something',
-      }, ctx);
-      assert.strictEqual(result.success, true);
-      assert.ok(result.planId);
-    });
-
-    test('passes work and checks through', async () => {
-      const mockPlan = createTestPlan();
-      const ctx = createContext();
-      (ctx.PlanRunner as any).enqueueJob = sinon.stub().returns(mockPlan);
-      const git = require('../../../git');
-      sinon.stub(git.branches, 'currentOrNull').resolves('main');
-      sinon.stub(git.orchestrator, 'resolveTargetBranchRoot').resolves({ targetBranchRoot: 'copilot_plan/test', needsCreation: false });
-      const vscode = require('vscode');
-      sinon.stub(vscode.workspace, 'getConfiguration').returns({ get: (key: string, def: any) => def });
-      const result = await handleCreateJob({
-        name: 'Build',
-        task: 'Build project',
-        work: 'npm run build',
-        prechecks: 'npm test',
-        postchecks: 'npm run lint',
-        baseBranch: 'develop',
-        targetBranch: 'release',
-      }, ctx);
-      assert.strictEqual(result.success, true);
-    });
-
-    test('catches enqueueJob errors', async () => {
-      const ctx = createContext();
-      (ctx.PlanRunner as any).enqueueJob = sinon.stub().throws(new Error('enqueue failed'));
-      const git = require('../../../git');
-      sinon.stub(git.branches, 'currentOrNull').resolves('main');
-      sinon.stub(git.orchestrator, 'resolveTargetBranchRoot').resolves({ targetBranchRoot: 'copilot_plan/test', needsCreation: false });
-      const vscode = require('vscode');
-      sinon.stub(vscode.workspace, 'getConfiguration').returns({ get: (key: string, def: any) => def });
-      const result = await handleCreateJob({
-        name: 'Job',
-        task: 'Do something',
       }, ctx);
       assert.strictEqual(result.success, false);
     });

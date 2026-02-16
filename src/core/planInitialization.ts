@@ -250,10 +250,11 @@ export async function initializeMcpServer(
   // Resolve McpHandler from a scoped container with runtime dependencies
   const scope = container.createScope();
   const { McpHandler } = require('../mcp/handler');
-  // eslint-disable-next-line no-restricted-syntax -- constructed inside scoped DI factory
+   
   scope.register(Tokens.IMcpRequestRouter, (c) => {
     const git = c.resolve<import('../interfaces/IGitOperations').IGitOperations>(Tokens.IGitOperations);
-    return new McpHandler(planRunner, workspacePath, git);
+    const copilotRunner = c.resolve<import('../interfaces/ICopilotRunner').ICopilotRunner>(Tokens.ICopilotRunner);
+    return new McpHandler(planRunner, workspacePath, git, copilotRunner);
   });
   const mcpHandler = scope.resolve<IMcpRequestRouter>(Tokens.IMcpRequestRouter);
 
@@ -546,7 +547,7 @@ export function registerPlanCommands(
           placeHolder: 'Select a plan to pause',
         });
         
-        if (!selected) return;
+        if (!selected) {return;}
         planId = selected.planId;
       }
       
@@ -582,7 +583,7 @@ export function registerPlanCommands(
           placeHolder: 'Select a plan to resume',
         });
         
-        if (!selected) return;
+        if (!selected) {return;}
         planId = selected.planId;
       }
       

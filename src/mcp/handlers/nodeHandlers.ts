@@ -8,218 +8,16 @@
  * @module mcp/handlers/nodeHandlers
  */
 
-import {
-  NodeSpec,
-  JobNodeSpec,
-  PlanSpec,
-} from '../../plan/types';
 import { validateAllowedFolders, validateAllowedUrls, validateAgentModels } from '../validation';
-import { PRODUCER_ID_PATTERN } from '../tools/planTools';
 import {
   PlanHandlerContext,
   errorResult,
   validateRequired,
-  resolveBaseBranch,
-  resolveTargetBranch,
 } from './utils';
-
-// ============================================================================
-// VALIDATION
-// ============================================================================
-
-/**
- * Validate node specs from create_copilot_node input.
- */
-function validateNodeSpecs(nodes: any[]): { valid: boolean; error?: string; specs?: NodeSpec[] } {
-  if (!Array.isArray(nodes) || nodes.length === 0) {
-    return { valid: false, error: 'Must provide at least one node in the nodes array' };
-  }
-
-  const errors: string[] = [];
-  const producerIds = new Set<string>();
-
-  for (let i = 0; i < nodes.length; i++) {
-    const node = nodes[i];
-
-    if (!node.producer_id) {
-      errors.push(`Node at index ${i} is missing required 'producer_id' field`);
-      continue;
-    }
-
-    if (!PRODUCER_ID_PATTERN.test(node.producer_id)) {
-      errors.push(
-        `Node '${node.producer_id}' has invalid producer_id format. ` +
-        `Must be 3-64 characters, lowercase letters, numbers, and hyphens only.`
-      );
-      continue;
-    }
-
-    if (producerIds.has(node.producer_id)) {
-      errors.push(`Duplicate producer_id: '${node.producer_id}'`);
-      continue;
-    }
-    producerIds.add(node.producer_id);
-
-    if (!node.task) {
-      errors.push(`Node '${node.producer_id}' is missing required 'task' field`);
-    }
-
-    if (!Array.isArray(node.dependencies)) {
-      errors.push(`Node '${node.producer_id}' must have a 'dependencies' array (use [] for root nodes)`);
-    }
-  }
-
-  // Validate dependency references
-  for (const node of nodes) {
-    if (!Array.isArray(node.dependencies)) continue;
-    for (const dep of node.dependencies) {
-      if (!producerIds.has(dep)) {
-        errors.push(
-          `Node '${node.producer_id}' references unknown dependency '${dep}'. ` +
-          `Valid producer_ids: ${[...producerIds].join(', ')}`
-        );
-      }
-      if (dep === node.producer_id) {
-        errors.push(`Node '${node.producer_id}' cannot depend on itself`);
-      }
-    }
-  }
-
-  if (errors.length > 0) {
-    return { valid: false, error: errors.join('; ') };
-  }
-
-  const specs: NodeSpec[] = nodes.map((n: any): NodeSpec => ({
-    producerId: n.producer_id,
-    name: n.name || n.producer_id,
-    task: n.task,
-    work: n.work,
-    prechecks: n.prechecks,
-    postchecks: n.postchecks,
-    instructions: n.instructions,
-    dependencies: n.dependencies || [],
-    baseBranch: n.base_branch,
-    expectsNoChanges: n.expects_no_changes,
-    group: n.group,
-  }));
-
-  return { valid: true, specs };
-}
 
 // ============================================================================
 // HANDLERS
 // ============================================================================
-
-/**
- * Handle the `create_copilot_node` MCP tool call.
- *
- * Creates nodes. Internally delegates to PlanRunner by converting to PlanSpec format.
- */
-export async function handleCreateNode(args: any, ctx: PlanHandlerContext): Promise<any> {
-  const validation = validateNodeSpecs(args.nodes);
-  if (!validation.valid || !validation.specs) {
-    return errorResult(validation.error || 'Invalid input');
-  }
-
-  // Validate agent model names
-  const modelValidation = await validateAgentModels(args, 'create_copilot_node');
-  if (!modelValidation.valid) {
-    return { success: false, error: modelValidation.error };
-  }
-
-  // Validate allowedFolders paths exist
-  const folderValidation = await validateAllowedFolders(args, 'create_copilot_node');
-  if (!folderValidation.valid) {
-    return { success: false, error: folderValidation.error };
-  }
-
-  // Validate allowedUrls are well-formed HTTP/HTTPS
-  const urlValidation = await validateAllowedUrls(args, 'create_copilot_node');
-  if (!urlValidation.valid) {
-    return { success: false, error: urlValidation.error };
-  }
-
-  try {
-    const repoPath = ctx.workspacePath;
-
-    if (validation.specs.length === 1) {
-      // Single node → create as a single job plan
-      const nodeSpec = validation.specs[0];
-      const nodeName = nodeSpec.name || nodeSpec.producerId;
-      const baseBranch = await resolveBaseBranch(repoPath, ctx.git, args.base_branch || nodeSpec.baseBranch);
-      const targetBranch = await resolveTargetBranch(baseBranch, repoPath, ctx.git, args.target_branch, nodeName);
-
-      const plan = ctx.PlanRunner.enqueueJob({
-        name: nodeName,
-        task: nodeSpec.task,
-        work: nodeSpec.work as string | undefined,
-        prechecks: nodeSpec.prechecks as string | undefined,
-        postchecks: nodeSpec.postchecks as string | undefined,
-        instructions: nodeSpec.instructions,
-        baseBranch,
-        targetBranch,
-        expectsNoChanges: nodeSpec.expectsNoChanges,
-      });
-
-      const nodeId = plan.roots[0];
-
-      return {
-        success: true,
-        nodeId,
-        groupId: plan.id,
-        baseBranch: plan.baseBranch,
-        targetBranch: plan.targetBranch,
-        message: `Node '${nodeName}' created. ` +
-                 `Use nodeId '${nodeId}' or groupId '${plan.id}' to monitor progress.`,
-      };
-    } else {
-      // Multiple nodes → create as a plan
-      const batchName = `Batch (${validation.specs.length} nodes)`;
-      const baseBranch = await resolveBaseBranch(repoPath, ctx.git, args.base_branch);
-      const targetBranch = await resolveTargetBranch(baseBranch, repoPath, ctx.git, args.target_branch, batchName);
-
-      const spec: PlanSpec = {
-        name: batchName,
-        repoPath,
-        baseBranch,
-        targetBranch,
-        maxParallel: args.max_parallel,
-        cleanUpSuccessfulWork: args.clean_up_successful_work,
-        jobs: validation.specs.map((n): JobNodeSpec => ({
-          producerId: n.producerId,
-          name: n.name,
-          task: n.task,
-          work: n.work,
-          prechecks: n.prechecks,
-          postchecks: n.postchecks,
-          instructions: n.instructions,
-          dependencies: n.dependencies,
-          baseBranch: n.baseBranch,
-          expectsNoChanges: n.expectsNoChanges,
-          group: n.group,
-        })),
-      };
-
-      const plan = ctx.PlanRunner.enqueue(spec);
-
-      const nodeMapping: Record<string, string> = {};
-      for (const [producerId, nodeId] of plan.producerIdToNodeId) {
-        nodeMapping[producerId] = nodeId;
-      }
-
-      return {
-        success: true,
-        groupId: plan.id,
-        nodeCount: plan.nodes.size,
-        nodeMapping,
-        message: `Batch of ${plan.nodes.size} nodes created. ` +
-                 `Use groupId '${plan.id}' to monitor progress.`,
-      };
-    }
-  } catch (error: any) {
-    return errorResult(error.message);
-  }
-}
 
 /**
  * Handle the `get_copilot_node` MCP tool call.
@@ -228,7 +26,7 @@ export async function handleCreateNode(args: any, ctx: PlanHandlerContext): Prom
  */
 export async function handleGetNode(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['node_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   // Search across all plans for the node
   const plans = ctx.PlanRunner.getAll();
@@ -300,18 +98,18 @@ export async function handleListNodes(args: any, ctx: PlanHandlerContext): Promi
 
   for (const plan of allPlans) {
     // Filter by group_id
-    if (args.group_id && plan.id !== args.group_id) continue;
+    if (args.group_id && plan.id !== args.group_id) {continue;}
 
     // Filter by group_name
     if (args.group_name &&
-        !plan.spec.name.toLowerCase().includes(args.group_name.toLowerCase())) continue;
+        !plan.spec.name.toLowerCase().includes(args.group_name.toLowerCase())) {continue;}
 
     for (const [nodeId, state] of plan.nodeStates) {
       // Filter by status
-      if (args.status && state.status !== args.status) continue;
+      if (args.status && state.status !== args.status) {continue;}
 
       const node = plan.nodes.get(nodeId);
-      if (!node) continue;
+      if (!node) {continue;}
 
       nodes.push({
         id: nodeId,
@@ -343,7 +141,7 @@ export async function handleListNodes(args: any, ctx: PlanHandlerContext): Promi
  */
 export async function handleGetGroupStatus(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['group_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   const status = ctx.PlanRunner.getStatus(args.group_id);
   if (!status) {
@@ -432,7 +230,7 @@ export async function handleListGroups(args: any, ctx: PlanHandlerContext): Prom
  */
 export async function handleCancelGroup(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['group_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   const plan = ctx.PlanRunner.getPlan(args.group_id);
   if (!plan) {
@@ -452,7 +250,7 @@ export async function handleCancelGroup(args: any, ctx: PlanHandlerContext): Pro
  */
 export async function handleDeleteGroup(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['group_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   const plan = ctx.PlanRunner.getPlan(args.group_id);
   if (!plan) {
@@ -472,7 +270,7 @@ export async function handleDeleteGroup(args: any, ctx: PlanHandlerContext): Pro
  */
 export async function handleRetryGroup(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['group_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   const plan = ctx.PlanRunner.getPlan(args.group_id);
   if (!plan) {
@@ -539,7 +337,7 @@ export async function handleRetryGroup(args: any, ctx: PlanHandlerContext): Prom
  */
 export async function handleRetryNode(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['node_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   // Validate agent model names if any new specs are provided
   if (args.newWork || args.newPrechecks || args.newPostchecks) {
@@ -599,7 +397,7 @@ export async function handleRetryNode(args: any, ctx: PlanHandlerContext): Promi
  */
 export async function handleForceFailNode(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['node_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   // Find the node across all plans
   const plans = ctx.PlanRunner.getAll();
@@ -633,7 +431,7 @@ export async function handleForceFailNode(args: any, ctx: PlanHandlerContext): P
  */
 export async function handleNodeFailureContext(args: any, ctx: PlanHandlerContext): Promise<any> {
   const fieldError = validateRequired(args, ['node_id']);
-  if (fieldError) return fieldError;
+  if (fieldError) {return fieldError;}
 
   const plans = ctx.PlanRunner.getAll();
   for (const plan of plans) {

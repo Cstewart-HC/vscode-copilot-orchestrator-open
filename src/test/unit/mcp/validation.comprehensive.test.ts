@@ -66,8 +66,7 @@ suite('MCP Validation Unit Tests', () => {
   suite('hasSchema', () => {
     test.skip('should return true for known tools', () => {
       assert.strictEqual(hasSchema('create_copilot_plan'), true);
-      assert.strictEqual(hasSchema('create_copilot_job'), true);
-      assert.strictEqual(hasSchema('get_plan_status'), true);
+      assert.strictEqual(hasSchema('get_copilot_plan_status'), true);
       assert.strictEqual(hasSchema('list_plans'), true);
       assert.strictEqual(hasSchema('get_node_details'), true);
     });
@@ -181,32 +180,6 @@ suite('MCP Validation Unit Tests', () => {
       };
       
       const result = validateInput('create_copilot_plan', invalidInput);
-      
-      assert.strictEqual(result.valid, false);
-      assert.ok(result.error);
-    });
-  });
-  
-  suite('validateInput - create_copilot_job', () => {
-    test('should validate simple job input', () => {
-      const validInput = {
-        name: 'Test Job',
-        task: 'Test task',
-        work: 'echo test'
-      };
-      
-      const result = validateInput('create_copilot_job', validInput);
-      
-      assert.strictEqual(result.valid, true);
-    });
-    
-    test('should require name and task', () => {
-      const invalidInput = {
-        // Missing name and task
-        work: 'echo test'
-      };
-      
-      const result = validateInput('create_copilot_job', invalidInput);
       
       assert.strictEqual(result.valid, false);
       assert.ok(result.error);

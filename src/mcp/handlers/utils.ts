@@ -12,6 +12,7 @@ import { ToolHandlerContext } from '../types';
 import { PlanInstance } from '../../plan/types';
 import { PlanRunner } from '../../plan/runner';
 import type { IGitOperations } from '../../interfaces/IGitOperations';
+import type { ICopilotRunner } from '../../interfaces/ICopilotRunner';
 
 /**
  * Extended handler context with access to the {@link PlanRunner} instance.
@@ -25,6 +26,8 @@ export interface PlanHandlerContext extends ToolHandlerContext {
   PlanRunner: PlanRunner;
   /** Git operations interface */
   git: IGitOperations;
+  /** Copilot CLI runner for instruction augmentation (optional for backward compat). */
+  copilotRunner?: ICopilotRunner;
 }
 
 /**
@@ -148,7 +151,7 @@ export type NodeHandlerContext = PlanHandlerContext;
  * @returns Resolved base branch name.
  */
 export async function resolveBaseBranch(repoPath: string, git: IGitOperations, requested?: string): Promise<string> {
-  if (requested) return requested;
+  if (requested) {return requested;}
   try {
     const current = await git.branches.currentOrNull(repoPath);
     return current || 'main';

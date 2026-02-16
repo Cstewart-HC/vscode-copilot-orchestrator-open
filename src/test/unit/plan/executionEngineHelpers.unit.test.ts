@@ -553,14 +553,14 @@ suite('JobExecutionEngine - helper methods', () => {
     });
   });
 
-  suite('gitignore failure path', () => {
-    test('gitignore ensureGitignoreEntries error is caught', async () => {
+  suite('gitignore management', () => {
+    test('per-worktree gitignore is not called (managed at repo level)', async () => {
       const dir = makeTmpDir();
       const plan = createTestPlan();
       const node = plan.nodes.get('node-1')! as JobNode;
       const sm = new PlanStateMachine(plan);
 
-      const { engine, state, log, gitOps } = createEngine(dir, {
+      const { engine, state, gitOps } = createEngine(dir, {
         execute: sinon.stub().resolves({
           success: true,
           completedCommit: 'commit123456789012345678901234567890ab',
@@ -570,14 +570,12 @@ suite('JobExecutionEngine - helper methods', () => {
       state.plans.set(plan.id, plan);
       state.stateMachines.set(plan.id, sm);
 
-      (gitOps.gitignore.ensureGitignoreEntries as sinon.SinonStub).rejects(new Error('permission denied'));
-
       await engine.executeJobNode(plan, sm, node);
 
-      // Should succeed despite gitignore error
       const ns = plan.nodeStates.get('node-1')!;
       assert.strictEqual(ns.status, 'succeeded');
-      assert.ok((log.warn as sinon.SinonStub).calledWithMatch(sinon.match(/gitignore|permission/i)));
+      // Per-worktree gitignore was removed — managed at repo level in planInitialization
+      assert.ok(!(gitOps.gitignore.ensureGitignoreEntries as sinon.SinonStub).called);
     });
   });
 
@@ -727,7 +725,7 @@ suite('JobExecutionEngine - helper methods', () => {
       });
       // Configure pushOnSuccess
       state.configManager.getConfig = ((section: string, key: string, def: any) => {
-        if (key === 'pushOnSuccess') return true;
+        if (key === 'pushOnSuccess') {return true;}
         return def;
       }) as any;
       state.plans.set(plan.id, plan);
@@ -754,7 +752,7 @@ suite('JobExecutionEngine - helper methods', () => {
         }),
       });
       state.configManager.getConfig = ((section: string, key: string, def: any) => {
-        if (key === 'pushOnSuccess') return true;
+        if (key === 'pushOnSuccess') {return true;}
         return def;
       }) as any;
       state.plans.set(plan.id, plan);
@@ -995,7 +993,7 @@ suite('JobExecutionEngine - helper methods', () => {
 
       // Create executor that calls the callbacks
       const executeStub = sinon.stub().callsFake(async (ctx: any) => {
-        if (ctx.onProgress) ctx.onProgress('Running work');
+        if (ctx.onProgress) {ctx.onProgress('Running work');}
         if (ctx.onStepStatusChange) {
           ctx.onStepStatusChange('work', 'running');
           ctx.onStepStatusChange('work', 'success');
@@ -1092,8 +1090,8 @@ suite('JobExecutionEngine - helper methods', () => {
       executeStub.onFirstCall().resolves(failResult);
       executeStub.onSecondCall().callsFake(async (ctx: any) => {
         // Invoke callbacks for coverage
-        if (ctx.onProgress) ctx.onProgress('Auto-heal in progress');
-        if (ctx.onStepStatusChange) ctx.onStepStatusChange('work', 'success');
+        if (ctx.onProgress) {ctx.onProgress('Auto-heal in progress');}
+        if (ctx.onStepStatusChange) {ctx.onStepStatusChange('work', 'success');}
         return healResult;
       });
 
